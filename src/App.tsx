@@ -7,6 +7,7 @@ import {
   Circle,
   GripVertical,
   MousePointer2,
+  Layout,
 } from "lucide-react";
 
 // --- Types ---
@@ -24,6 +25,7 @@ interface EdgeData {
   id: string;
   source: string;
   target: string;
+  label?: string; // Added label support for edges
 }
 
 interface Selection {
@@ -115,7 +117,6 @@ export default function App() {
     const tx = "id" in target ? target.x + NODE_WIDTH / 2 : target.x;
     const ty = "id" in target ? target.y + NODE_HEIGHT / 2 : target.y;
 
-    // Bezier Curve Logic
     // const deltaX = Math.abs(tx - sx);
     // If mostly vertical
     if (Math.abs(ty - sy) > Math.abs(tx - sx)) {
@@ -151,7 +152,7 @@ export default function App() {
     };
 
     setNodes((nds) => [...nds, newNode]);
-    setSelection({ id: newNode.id, type: "node" }); // Auto-select new node
+    setSelection({ id: newNode.id, type: "node" });
   };
 
   const handleDragOver = (e: React.DragEvent) => {
@@ -173,7 +174,7 @@ export default function App() {
     if (connectingSource) return;
 
     setIsDraggingNode(id);
-    setSelection({ id, type: "node" }); // Select node on click
+    setSelection({ id, type: "node" });
 
     const rect = canvasRef.current!.getBoundingClientRect();
     setDragOffset({
@@ -236,13 +237,29 @@ export default function App() {
       const exists = edges.find(
         (edge) => edge.source === connectingSource && edge.target === targetId
       );
+
       if (!exists) {
+        const sourceNode = nodes.find((n) => n.id === connectingSource);
+        const targetNode = nodes.find((n) => n.id === targetId);
+
+        let label: string | undefined;
+
+        // Decision Logic: Left = No, Right = Yes
+        if (sourceNode?.type === "decision" && targetNode) {
+          if (targetNode.x < sourceNode.x) {
+            label = "No";
+          } else {
+            label = "Yes";
+          }
+        }
+
         setEdges((eds) => [
           ...eds,
           {
             id: crypto.randomUUID(),
             source: connectingSource,
             target: targetId,
+            label,
           },
         ]);
       }
@@ -267,7 +284,6 @@ export default function App() {
     if (!selection) return;
 
     if (selection.type === "node") {
-      // Delete node and connected edges
       setNodes((nds) => nds.filter((n) => n.id !== selection.id));
       setEdges((eds) =>
         eds.filter(
@@ -275,7 +291,6 @@ export default function App() {
         )
       );
     } else if (selection.type === "edge") {
-      // Delete just the edge
       setEdges((eds) => eds.filter((e) => e.id !== selection.id));
     }
 
@@ -298,16 +313,124 @@ export default function App() {
   // --- Keyboard Shortcuts ---
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (editingId) return; // Don't delete if typing in an input
-
+      if (editingId) return;
       if (e.key === "Delete" || e.key === "Backspace") {
         deleteSelected();
       }
     };
-
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [deleteSelected, editingId]);
+
+  // --- Auto Layout Algorithm ---
+  const handleSaveAndLayout = () => {
+    // 1. Build Graph Relationships
+    const childrenMap = new Map<string, string[]>();
+    const parentsMap = new Map<string, string[]>();
+    nodes.forEach((n) => {
+      childrenMap.set(n.id, []);
+      parentsMap.set(n.id, []);
+    });
+    edges.forEach((e) => {
+      childrenMap.get(e.source)?.push(e.target);
+      parentsMap.get(e.target)?.push(e.source);
+    });
+
+    // 2. Determine Levels (BFS)
+    let roots = nodes.filter((n) => (parentsMap.get(n.id)?.length || 0) === 0);
+    if (roots.length === 0 && nodes.length > 0) roots = [nodes[0]];
+
+    const levels = new Map<string, number>();
+    const visited = new Set<string>();
+    const queue: { id: string; level: number }[] = roots.map((n) => ({
+      id: n.id,
+      level: 0,
+    }));
+    let maxLevel = 0;
+
+    while (queue.length > 0) {
+      const { id, level } = queue.shift()!;
+      if (visited.has(id)) continue;
+      visited.add(id);
+
+      levels.set(id, level);
+      maxLevel = Math.max(maxLevel, level);
+
+      const children = childrenMap.get(id) || [];
+      children.forEach((childId) => {
+        queue.push({ id: childId, level: level + 1 });
+      });
+    }
+
+    // 3. Group Nodes by Level and Sort
+    const levelsArray: string[][] = [];
+    for (let i = 0; i <= maxLevel; i++) levelsArray[i] = [];
+
+    nodes.forEach((n) => {
+      const l = levels.get(n.id) ?? 0;
+      if (!levelsArray[l]) levelsArray[l] = [];
+      levelsArray[l].push(n.id);
+    });
+
+    const spacingX = 60;
+    const spacingY = 120;
+    const updatedPositions = new Map<string, { x: number; y: number }>();
+    const CENTER_X = (canvasRef.current?.clientWidth || 1000) / 2;
+
+    for (let l = 0; l <= maxLevel; l++) {
+      const rowNodes = levelsArray[l];
+
+      if (l > 0) {
+        rowNodes.sort((a, b) => {
+          const parentsA = parentsMap.get(a) || [];
+          const parentsB = parentsMap.get(b) || [];
+
+          const avgA =
+            parentsA.length > 0
+              ? parentsA.reduce(
+                  (sum, pid) => sum + (updatedPositions.get(pid)?.x || 0),
+                  0
+                ) / parentsA.length
+              : 0;
+          const avgB =
+            parentsB.length > 0
+              ? parentsB.reduce(
+                  (sum, pid) => sum + (updatedPositions.get(pid)?.x || 0),
+                  0
+                ) / parentsB.length
+              : 0;
+
+          if (parentsA.length === 0 && parentsB.length === 0) return 0;
+          if (parentsA.length === 0) return 1;
+          if (parentsB.length === 0) return -1;
+
+          return avgA - avgB;
+        });
+      }
+
+      const totalWidth =
+        rowNodes.length * NODE_WIDTH + (rowNodes.length - 1) * spacingX;
+      let currentX = CENTER_X - totalWidth / 2;
+
+      rowNodes.forEach((nid) => {
+        const newPos = {
+          x: currentX,
+          y: 100 + l * (NODE_HEIGHT + spacingY),
+        };
+        updatedPositions.set(nid, newPos);
+        currentX += NODE_WIDTH + spacingX;
+      });
+    }
+
+    setNodes((prev) =>
+      prev.map((n) => {
+        const newPos = updatedPositions.get(n.id);
+        return newPos ? { ...n, ...newPos } : n;
+      })
+    );
+
+    console.log("Graph Saved:", { nodes, edges });
+  };
 
   // --- Rendering ---
   const selectedNode =
@@ -411,7 +534,7 @@ export default function App() {
 
       {/* Canvas Area */}
       <div className="flex-1 relative bg-slate-100 overflow-hidden flex flex-col">
-        {/* Toolbar */}
+        {/* Toolbar Left */}
         <div className="absolute top-4 left-4 z-20 bg-white/90 backdrop-blur p-1 rounded-lg border border-slate-200 shadow-sm flex gap-2 items-center">
           <button
             onClick={() => {
@@ -427,11 +550,19 @@ export default function App() {
           <div className="w-px h-6 bg-slate-200 mx-1"></div>
           <div className="flex items-center gap-2 px-2 text-xs text-slate-500">
             <MousePointer2 size={14} />
-            <span>
-              Select items to edit •{" "}
-              <span className="font-bold">Backspace/Delete</span> to remove
-            </span>
+            <span>Select items to edit</span>
           </div>
+        </div>
+
+        {/* Toolbar Right (Save & Arrange) */}
+        <div className="absolute top-4 right-4 z-20">
+          <button
+            onClick={handleSaveAndLayout}
+            className="flex items-center gap-2 bg-slate-900 hover:bg-slate-800 text-white px-4 py-2 rounded-lg shadow-sm transition-all active:scale-95 font-medium text-sm"
+          >
+            <Layout size={16} />
+            Save & Arrange
+          </button>
         </div>
 
         <div
@@ -482,6 +613,14 @@ export default function App() {
               const isSelected =
                 selection?.type === "edge" && selection.id === edge.id;
 
+              // Calculate Midpoint for Label
+              const sx = source.x + NODE_WIDTH / 2;
+              const sy = source.y + NODE_HEIGHT / 2;
+              const tx = target.x + NODE_WIDTH / 2;
+              const ty = target.y + NODE_HEIGHT / 2;
+              const midX = (sx + tx) / 2;
+              const midY = (sy + ty) / 2;
+
               return (
                 <g key={edge.id}>
                   {/* Invisible wide path for easier clicking */}
@@ -507,8 +646,39 @@ export default function App() {
                         ? "url(#arrowhead-selected)"
                         : "url(#arrowhead)"
                     }
-                    className="pointer-events-none transition-all"
+                    className="pointer-events-none transition-all transition-[d] duration-300 ease-in-out"
                   />
+
+                  {/* Label for Decision Edges */}
+                  {edge.label && (
+                    <g
+                      transform={`translate(${midX}, ${midY})`}
+                      className="pointer-events-none"
+                    >
+                      <rect
+                        x="-16"
+                        y="-10"
+                        width="32"
+                        height="20"
+                        rx="10"
+                        fill={edge.label === "Yes" ? "#dcfce7" : "#fee2e2"}
+                        stroke={edge.label === "Yes" ? "#16a34a" : "#dc2626"}
+                        strokeWidth="1"
+                      />
+                      <text
+                        x="0"
+                        y="4"
+                        textAnchor="middle"
+                        className={`text-[10px] font-bold ${
+                          edge.label === "Yes"
+                            ? "fill-green-700"
+                            : "fill-red-700"
+                        }`}
+                      >
+                        {edge.label}
+                      </text>
+                    </g>
+                  )}
                 </g>
               );
             })}
@@ -545,6 +715,10 @@ export default function App() {
                   top: node.y,
                   width: NODE_WIDTH,
                   height: NODE_HEIGHT,
+                  transition:
+                    isDraggingNode === node.id
+                      ? "none"
+                      : "left 0.3s ease, top 0.3s ease", // Smooth transition for auto-layout
                 }}
               >
                 {/* Connection Handle */}
