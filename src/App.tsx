@@ -6,6 +6,7 @@ import {
   Diamond,
   Circle,
   GripVertical,
+  MousePointer2,
 } from "lucide-react";
 
 // --- Types ---
@@ -23,6 +24,11 @@ interface EdgeData {
   id: string;
   source: string;
   target: string;
+}
+
+interface Selection {
+  id: string;
+  type: "node" | "edge";
 }
 
 // --- Constants ---
@@ -57,8 +63,8 @@ const getNodeStyles = (type: NodeType, isSelected: boolean) => {
   const base =
     "flex items-center justify-center text-sm font-medium transition-all duration-200 border-2 shadow-sm select-none cursor-grab active:cursor-grabbing";
   const selected = isSelected
-    ? "ring-2 ring-blue-500 ring-offset-2 border-blue-600"
-    : "border-slate-300 hover:border-slate-400";
+    ? "ring-2 ring-blue-500 ring-offset-2 border-blue-600 z-10"
+    : "border-slate-300 hover:border-slate-400 z-1";
 
   let shape = "";
   switch (type) {
@@ -82,21 +88,44 @@ const getNodeStyles = (type: NodeType, isSelected: boolean) => {
 export default function App() {
   const [nodes, setNodes] = useState<NodeData[]>([]);
   const [edges, setEdges] = useState<EdgeData[]>([]);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+
+  // Unified selection state
+  const [selection, setSelection] = useState<Selection | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
 
-  // Dragging State (Moving an existing node)
+  // Dragging State
   const [isDraggingNode, setIsDraggingNode] = useState<string | null>(null);
   const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
 
-  // Connecting State (Drawing a line)
+  // Connecting State
   const [connectingSource, setConnectingSource] = useState<string | null>(null);
   const [mousePos, setMousePos] = useState({ x: 0, y: 0 });
 
   const canvasRef = useRef<HTMLDivElement>(null);
 
-  // --- Actions: Adding New Nodes ---
+  // --- Helper: Calculate Paths ---
+  const getEdgePath = (
+    source: NodeData,
+    target: NodeData | { x: number; y: number }
+  ) => {
+    const sx = source.x + NODE_WIDTH / 2;
+    const sy = source.y + NODE_HEIGHT / 2;
 
+    // If target is a node, calculate center. If it's mouse pos, use raw x/y
+    const tx = "id" in target ? target.x + NODE_WIDTH / 2 : target.x;
+    const ty = "id" in target ? target.y + NODE_HEIGHT / 2 : target.y;
+
+    // Bezier Curve Logic
+    // const deltaX = Math.abs(tx - sx);
+    // If mostly vertical
+    if (Math.abs(ty - sy) > Math.abs(tx - sx)) {
+      return `M ${sx} ${sy} C ${sx} ${sy + 60}, ${tx} ${ty - 60}, ${tx} ${ty}`;
+    }
+    // Mostly horizontal
+    return `M ${sx} ${sy} C ${sx + 60} ${sy}, ${tx - 60} ${ty}, ${tx} ${ty}`;
+  };
+
+  // --- Actions: Adding New Nodes ---
   const handleDragStart = (e: React.DragEvent, type: NodeType) => {
     e.dataTransfer.setData("application/reactflow", type);
     e.dataTransfer.effectAllowed = "move";
@@ -122,6 +151,7 @@ export default function App() {
     };
 
     setNodes((nds) => [...nds, newNode]);
+    setSelection({ id: newNode.id, type: "node" }); // Auto-select new node
   };
 
   const handleDragOver = (e: React.DragEvent) => {
@@ -130,22 +160,20 @@ export default function App() {
   };
 
   // --- Actions: Moving Existing Nodes ---
-
   const startMovingNode = (
     e: React.MouseEvent,
     id: string,
     x: number,
     y: number
   ) => {
-    if (editingId === id) return; // Don't move if editing text
-
-    e.preventDefault(); // Prevent browser text selection
+    if (editingId === id) return;
+    e.preventDefault();
     e.stopPropagation();
 
     if (connectingSource) return;
 
     setIsDraggingNode(id);
-    setSelectedId(id);
+    setSelection({ id, type: "node" }); // Select node on click
 
     const rect = canvasRef.current!.getBoundingClientRect();
     setDragOffset({
@@ -164,10 +192,8 @@ export default function App() {
       setMousePos({ x: rawX, y: rawY });
 
       if (isDraggingNode) {
-        // Snap to grid
         let newX = rawX - dragOffset.x;
         let newY = rawY - dragOffset.y;
-
         newX = Math.round(newX / GRID_SIZE) * GRID_SIZE;
         newY = Math.round(newY / GRID_SIZE) * GRID_SIZE;
 
@@ -181,7 +207,6 @@ export default function App() {
     [isDraggingNode, dragOffset]
   );
 
-  // Global mouse up to catch releases outside the node
   const handleGlobalMouseUp = useCallback(() => {
     setIsDraggingNode(null);
     if (connectingSource) {
@@ -199,7 +224,6 @@ export default function App() {
   }, [handleMouseMove, handleGlobalMouseUp]);
 
   // --- Connection Logic ---
-
   const startConnection = (e: React.MouseEvent, nodeId: string) => {
     e.stopPropagation();
     e.preventDefault();
@@ -226,37 +250,38 @@ export default function App() {
     setConnectingSource(null);
   };
 
-  // --- Unified Node MouseUp Handler (The Fix) ---
   const handleNodeMouseUp = (e: React.MouseEvent, nodeId: string) => {
-    // Case 1: Completing a connection (Drawing a line)
     if (connectingSource) {
       completeConnection(e, nodeId);
       return;
     }
-
-    // Case 2: Finishing a move (Dragging the node)
-    // We explicitly handle this here because the 'completeConnection' logic
-    // or event bubbling might otherwise block the global window listener.
     if (isDraggingNode) {
       setIsDraggingNode(null);
-      e.stopPropagation(); // Prevent clicking through to canvas (which would deselect)
+      e.stopPropagation();
       return;
     }
   };
 
   // --- Deletion & Editing ---
-  const deleteSelected = () => {
-    if (!selectedId) return;
-    const isNode = nodes.find((n) => n.id === selectedId);
-    if (isNode) {
-      setNodes((nds) => nds.filter((n) => n.id !== selectedId));
+  const deleteSelected = useCallback(() => {
+    if (!selection) return;
+
+    if (selection.type === "node") {
+      // Delete node and connected edges
+      setNodes((nds) => nds.filter((n) => n.id !== selection.id));
       setEdges((eds) =>
-        eds.filter((e) => e.source !== selectedId && e.target !== selectedId)
+        eds.filter(
+          (e) => e.source !== selection.id && e.target !== selection.id
+        )
       );
+    } else if (selection.type === "edge") {
+      // Delete just the edge
+      setEdges((eds) => eds.filter((e) => e.id !== selection.id));
     }
-    setSelectedId(null);
+
+    setSelection(null);
     setEditingId(null);
-  };
+  }, [selection]);
 
   const handleDoubleClick = (e: React.MouseEvent, id: string) => {
     e.stopPropagation();
@@ -270,34 +295,31 @@ export default function App() {
     );
   };
 
-  const handleInputBlur = () => {
-    setEditingId(null);
-  };
+  // --- Keyboard Shortcuts ---
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (editingId) return; // Don't delete if typing in an input
 
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === "Enter") {
-      setEditingId(null);
-    }
-  };
+      if (e.key === "Delete" || e.key === "Backspace") {
+        deleteSelected();
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [deleteSelected, editingId]);
 
   // --- Rendering ---
-
-  const renderPath = (x1: number, y1: number, x2: number, y2: number) => {
-    // const deltaX = Math.abs(x2 - x1);
-    // If mostly vertical
-    if (Math.abs(y2 - y1) > Math.abs(x2 - x1)) {
-      return `M ${x1} ${y1} C ${x1} ${y1 + 50}, ${x2} ${y2 - 50}, ${x2} ${y2}`;
-    }
-    // Mostly horizontal
-    return `M ${x1} ${y1} C ${x1 + 50} ${y1}, ${x2 - 50} ${y2}, ${x2} ${y2}`;
-  };
-
-  const selectedNode = nodes.find((n) => n.id === selectedId);
+  const selectedNode =
+    selection?.type === "node"
+      ? nodes.find((n) => n.id === selection.id)
+      : null;
+  const connectingNode = nodes.find((n) => n.id === connectingSource);
 
   return (
     <div className="flex h-screen w-full bg-slate-50 text-slate-900 font-sans overflow-hidden">
       {/* Sidebar */}
-      <div className="w-64 bg-white border-r border-slate-200 flex flex-col shadow-sm z-10">
+      <div className="w-64 bg-white border-r border-slate-200 flex flex-col shadow-sm z-20">
         <div className="p-4 border-b border-slate-100">
           <h1 className="font-bold text-lg flex items-center gap-2 text-slate-800">
             <span className="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center text-white">
@@ -314,7 +336,6 @@ export default function App() {
           <div className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-1">
             Flow Elements
           </div>
-
           {["start", "process", "decision", "end"].map((t) => (
             <div
               key={t}
@@ -334,9 +355,23 @@ export default function App() {
         {/* Properties Panel */}
         <div className="p-4 border-t border-slate-200 bg-slate-50">
           <div className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-3">
-            Properties
+            {selection?.type === "edge" ? "Connection Selected" : "Properties"}
           </div>
-          {selectedNode ? (
+
+          {selection?.type === "edge" ? (
+            <div className="flex flex-col gap-3">
+              <div className="text-sm text-slate-600 bg-blue-50 p-3 rounded border border-blue-100">
+                Connection selected. Press{" "}
+                <span className="font-bold">Delete</span> to remove.
+              </div>
+              <button
+                onClick={deleteSelected}
+                className="flex items-center justify-center gap-1 text-red-600 bg-red-50 hover:bg-red-100 px-3 py-2 rounded text-sm font-medium transition-colors w-full"
+              >
+                <Trash2 size={14} /> Delete Connection
+              </button>
+            </div>
+          ) : selectedNode ? (
             <div className="flex flex-col gap-3">
               <div>
                 <label className="text-xs font-medium text-slate-500 mb-1 block">
@@ -368,7 +403,7 @@ export default function App() {
             </div>
           ) : (
             <div className="text-sm text-slate-400 italic text-center py-4">
-              Select a node to edit
+              Select a node or connection
             </div>
           )}
         </div>
@@ -377,21 +412,26 @@ export default function App() {
       {/* Canvas Area */}
       <div className="flex-1 relative bg-slate-100 overflow-hidden flex flex-col">
         {/* Toolbar */}
-        <div className="absolute top-4 left-4 z-20 bg-white/90 backdrop-blur p-1 rounded-lg border border-slate-200 shadow-sm flex gap-2">
+        <div className="absolute top-4 left-4 z-20 bg-white/90 backdrop-blur p-1 rounded-lg border border-slate-200 shadow-sm flex gap-2 items-center">
           <button
             onClick={() => {
               setNodes([]);
               setEdges([]);
+              setSelection(null);
             }}
             className="p-2 hover:bg-slate-100 rounded-md text-slate-600 tooltip"
             title="Clear Canvas"
           >
             <Trash2 size={18} />
           </button>
-          <div className="w-px bg-slate-200 mx-1"></div>
-          <span className="text-xs text-slate-500 flex items-center px-2">
-            Double-click node to edit text
-          </span>
+          <div className="w-px h-6 bg-slate-200 mx-1"></div>
+          <div className="flex items-center gap-2 px-2 text-xs text-slate-500">
+            <MousePointer2 size={14} />
+            <span>
+              Select items to edit •{" "}
+              <span className="font-bold">Backspace/Delete</span> to remove
+            </span>
+          </div>
         </div>
 
         <div
@@ -399,17 +439,17 @@ export default function App() {
           className="flex-1 relative overflow-hidden cursor-crosshair"
           onDragOver={handleDragOver}
           onDrop={handleDrop}
-          onClick={() => {
-            setSelectedId(null);
+          onMouseDown={() => {
+            setSelection(null);
             setEditingId(null);
-          }}
+          }} // Deselect on canvas click
           style={{
             backgroundImage: "radial-gradient(#cbd5e1 1px, transparent 1px)",
             backgroundSize: `${GRID_SIZE}px ${GRID_SIZE}px`,
           }}
         >
           {/* SVG Layer for Connections */}
-          <svg className="absolute inset-0 w-full h-full pointer-events-none z-0 overflow-visible">
+          <svg className="absolute inset-0 w-full h-full z-0 overflow-visible pointer-events-none">
             <defs>
               <marker
                 id="arrowhead"
@@ -421,51 +461,75 @@ export default function App() {
               >
                 <polygon points="0 0, 10 3.5, 0 7" fill="#94a3b8" />
               </marker>
+              <marker
+                id="arrowhead-selected"
+                markerWidth="10"
+                markerHeight="7"
+                refX="9"
+                refY="3.5"
+                orient="auto"
+              >
+                <polygon points="0 0, 10 3.5, 0 7" fill="#3b82f6" />
+              </marker>
             </defs>
+
             {edges.map((edge) => {
               const source = nodes.find((n) => n.id === edge.source);
               const target = nodes.find((n) => n.id === edge.target);
               if (!source || !target) return null;
 
-              const sx = source.x + NODE_WIDTH / 2;
-              const sy = source.y + NODE_HEIGHT / 2;
-              const tx = target.x + NODE_WIDTH / 2;
-              const ty = target.y + NODE_HEIGHT / 2;
+              const pathD = getEdgePath(source, target);
+              const isSelected =
+                selection?.type === "edge" && selection.id === edge.id;
 
               return (
-                <path
-                  key={edge.id}
-                  d={renderPath(sx, sy, tx, ty)}
-                  fill="none"
-                  stroke="#94a3b8"
-                  strokeWidth="2"
-                  markerEnd="url(#arrowhead)"
-                />
+                <g key={edge.id}>
+                  {/* Invisible wide path for easier clicking */}
+                  <path
+                    d={pathD}
+                    fill="none"
+                    stroke="transparent"
+                    strokeWidth="20"
+                    className="pointer-events-auto cursor-pointer hover:stroke-blue-500/10 transition-colors"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setSelection({ id: edge.id, type: "edge" });
+                    }}
+                  />
+                  {/* Visible Path */}
+                  <path
+                    d={pathD}
+                    fill="none"
+                    stroke={isSelected ? "#3b82f6" : "#94a3b8"}
+                    strokeWidth={isSelected ? "3" : "2"}
+                    markerEnd={
+                      isSelected
+                        ? "url(#arrowhead-selected)"
+                        : "url(#arrowhead)"
+                    }
+                    className="pointer-events-none transition-all"
+                  />
+                </g>
               );
             })}
 
-            {/* Active Connection Line */}
-            {connectingSource && (
+            {/* Active Connection Line (Ghost line while connecting) */}
+            {connectingSource && connectingNode && (
               <path
-                d={renderPath(
-                  nodes.find((n) => n.id === connectingSource)!.x +
-                    NODE_WIDTH / 2,
-                  nodes.find((n) => n.id === connectingSource)!.y +
-                    NODE_HEIGHT / 2,
-                  mousePos.x,
-                  mousePos.y
-                )}
+                d={getEdgePath(connectingNode, mousePos)}
                 fill="none"
                 stroke="#3b82f6"
                 strokeWidth="2"
                 strokeDasharray="5,5"
+                markerEnd="url(#arrowhead-selected)"
               />
             )}
           </svg>
 
           {/* Nodes Layer */}
           {nodes.map((node) => {
-            const isSelected = selectedId === node.id;
+            const isSelected =
+              selection?.type === "node" && selection.id === node.id;
             const isEditing = editingId === node.id;
 
             return (
@@ -481,16 +545,15 @@ export default function App() {
                   top: node.y,
                   width: NODE_WIDTH,
                   height: NODE_HEIGHT,
-                  zIndex: isSelected || isEditing ? 10 : 1,
                 }}
               >
                 {/* Connection Handle */}
                 {!isEditing && (
                   <div
-                    className="absolute -right-3 top-1/2 -translate-y-1/2 w-6 h-6 bg-transparent flex items-center justify-center cursor-crosshair group"
+                    className="absolute -right-3 top-1/2 -translate-y-1/2 w-6 h-6 bg-transparent flex items-center justify-center cursor-crosshair group z-20"
                     onMouseDown={(e) => startConnection(e, node.id)}
                   >
-                    <div className="w-3 h-3 bg-white border-2 border-blue-500 rounded-full group-hover:scale-125 transition-transform" />
+                    <div className="w-3 h-3 bg-white border-2 border-blue-500 rounded-full group-hover:scale-125 transition-transform shadow-sm" />
                   </div>
                 )}
 
@@ -508,9 +571,9 @@ export default function App() {
                       onChange={(e) =>
                         handleLabelChange(node.id, e.target.value)
                       }
-                      onBlur={handleInputBlur}
-                      onKeyDown={handleKeyDown}
-                      onMouseDown={(e) => e.stopPropagation()} // Stop drag start when clicking input
+                      onBlur={() => setEditingId(null)}
+                      onKeyDown={(e) => e.key === "Enter" && setEditingId(null)}
+                      onMouseDown={(e) => e.stopPropagation()}
                       className="w-full text-center bg-white/50 border border-blue-300 rounded px-1 py-0.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
                     />
                   ) : (
